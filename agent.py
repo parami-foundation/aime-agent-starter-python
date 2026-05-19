@@ -37,6 +37,7 @@ import strategies
 import memory as mem
 import reflection_loop
 import chat_server
+import event_watcher
 from agent_brain import AgentBrain
 
 load_dotenv()
@@ -272,6 +273,10 @@ def trade_once(
     *,
     stop_loss_pct: float | None = -0.5,
     take_profit_pct: float | None = 1.0,
+    alerts_enabled: bool = True,
+    alerts_balance_low: float = 50.0,
+    alerts_drawdown: tuple[float, ...] = (0.2, 0.5),
+    alerts_profit: tuple[float, ...] = (0.1, 0.2, 0.5),
 ):
     # 1. drain inbox — messages from main AI
     new_msgs = mem.drain_inbox()
@@ -352,10 +357,13 @@ def trade_once(
                 },
             )
             trades += 1
+            event_watcher.record_trade_outcome(True)
         except requests.HTTPError as e:
             log.error("  %s → trade failed: %s %s", title[:40], e.response.status_code, e.response.text[:200])
+            event_watcher.record_trade_outcome(False)
         except Exception as e:
             log.error("  %s → trade failed: %s", title[:40], e)
+            event_watcher.record_trade_outcome(False)
 
     log.info("✅ Cycle done. Placed %d trades.", trades)
 
@@ -376,15 +384,34 @@ def trade_once(
         "strategy": fallback_strategy.__name__ if hasattr(fallback_strategy, "__name__") else str(fallback_strategy),
     })
 
+    # 3. proactive alerts — the pet talks unprompted when something matters.
+    if alerts_enabled:
+        try:
+            event_watcher.check_all(
+                balance=balance,
+                brain=brain,
+                balance_low_threshold=alerts_balance_low,
+                drawdown_thresholds=alerts_drawdown,
+                profit_thresholds=alerts_profit,
+            )
+        except Exception:
+            log.exception("event_watcher.check_all failed (cycle continues)")
+
 
 def trade_loop(api, brain, fallback_strategy, base_amount, interval,
-               *, stop_loss_pct=None, take_profit_pct=None):
+               *, stop_loss_pct=None, take_profit_pct=None,
+               alerts_enabled=True, alerts_balance_low=50.0,
+               alerts_drawdown=(0.2, 0.5), alerts_profit=(0.1, 0.2, 0.5)):
     while True:
         try:
             trade_once(
                 api, brain, fallback_strategy, base_amount,
                 stop_loss_pct=stop_loss_pct,
                 take_profit_pct=take_profit_pct,
+                alerts_enabled=alerts_enabled,
+                alerts_balance_low=alerts_balance_low,
+                alerts_drawdown=alerts_drawdown,
+                alerts_profit=alerts_profit,
             )
             check_for_outbox_events(api)
         except KeyboardInterrupt:
@@ -421,6 +448,14 @@ def main():
                              "Default 1.0 = take profit at 2x. Pass a very large number to disable.")
     parser.add_argument("--no-position-management", action="store_true",
                         help="skip the position-scan / stop-loss / take-profit step at the top of each cycle.")
+    parser.add_argument("--no-alerts", action="store_true",
+                        help="disable proactive event alerts (balance_low / drawdown / streaks / etc).")
+    parser.add_argument("--alerts-balance-low", type=float, default=50.0,
+                        help="USD threshold for the balance_low alert (default 50).")
+    parser.add_argument("--alerts-drawdown", type=str, default="0.2,0.5",
+                        help="comma-sep fractions for drawdown alerts (default 0.2,0.5 = -20%%/-50%% from peak).")
+    parser.add_argument("--alerts-profit", type=str, default="0.1,0.2,0.5",
+                        help="comma-sep fractions for profit milestones (default 0.1,0.2,0.5 = +10%%/+20%%/+50%%).")
     parser.add_argument("--once", action="store_true", help="run one trade cycle and exit")
     parser.add_argument("--no-reflection", action="store_true", help="disable reflection loop")
     parser.add_argument("--no-trade", action="store_true",
@@ -485,6 +520,23 @@ def main():
 
     sl = None if args.no_position_management else args.stop_loss
     tp = None if args.no_position_management else args.take_profit
+
+    def _parse_csv_floats(s: str) -> tuple[float, ...]:
+        out: list[float] = []
+        for chunk in (s or "").split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
+                out.append(float(chunk))
+            except ValueError:
+                log.warning("ignoring bad threshold: %r", chunk)
+        return tuple(out)
+
+    alerts_enabled = not args.no_alerts
+    alerts_drawdown = _parse_csv_floats(args.alerts_drawdown) or (0.2, 0.5)
+    alerts_profit = _parse_csv_floats(args.alerts_profit) or (0.1, 0.2, 0.5)
+
     if not args.no_trade:
         if args.no_position_management:
             log.info("   position management: DISABLED (--no-position-management)")
@@ -492,10 +544,22 @@ def main():
             log.info("   position rules: stop-loss at value/cost ≤ %.2f, "
                      "take-profit at value/cost ≥ %.2f",
                      1.0 + sl, 1.0 + tp)
+        if alerts_enabled:
+            wh = "on" if os.environ.get("AIME_WEBHOOK_URL") else "off"
+            log.info("   alerts: balance<$%.0f, drawdown @ %s, profit @ %s (webhook: %s)",
+                     args.alerts_balance_low,
+                     ",".join(f"{t*100:.0f}%" for t in alerts_drawdown),
+                     ",".join(f"+{t*100:.0f}%" for t in alerts_profit), wh)
+        else:
+            log.info("   alerts: DISABLED (--no-alerts)")
 
     if args.once:
         trade_once(api, brain, fallback, args.amount,
-                   stop_loss_pct=sl, take_profit_pct=tp)
+                   stop_loss_pct=sl, take_profit_pct=tp,
+                   alerts_enabled=alerts_enabled,
+                   alerts_balance_low=args.alerts_balance_low,
+                   alerts_drawdown=alerts_drawdown,
+                   alerts_profit=alerts_profit)
         return
 
     # In --no-trade mode the daemon is a pure conversational bridge:
@@ -514,7 +578,11 @@ def main():
 
     try:
         trade_loop(api, brain, fallback, args.amount, args.interval,
-                   stop_loss_pct=sl, take_profit_pct=tp)
+                   stop_loss_pct=sl, take_profit_pct=tp,
+                   alerts_enabled=alerts_enabled,
+                   alerts_balance_low=args.alerts_balance_low,
+                   alerts_drawdown=alerts_drawdown,
+                   alerts_profit=alerts_profit)
     except KeyboardInterrupt:
         log.info("Shutting down.")
 
