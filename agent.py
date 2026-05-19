@@ -263,8 +263,11 @@ def trade_loop(api, brain, fallback_strategy, base_amount, interval):
 def main():
     parser = argparse.ArgumentParser(description="AIME conversational trading subagent")
     parser.add_argument("--strategy", choices=list(STRATEGY_MAP.keys()), default="contrarian")
-    parser.add_argument("--amount", type=float, default=5.0)
-    parser.add_argument("--interval", type=int, default=120, help="trade loop interval (s)")
+    parser.add_argument("--amount", type=float, default=1.0,
+                        help="base trade size USD (default 1.0 — small on purpose so a new user "
+                             "isn't shocked watching it run; bump up once you trust the agent)")
+    parser.add_argument("--interval", type=int, default=300,
+                        help="trade loop interval seconds (default 300 = 5 min; was 120 in older versions)")
     parser.add_argument("--reflection-interval", type=int, default=3600, help="reflection loop interval (s)")
     parser.add_argument("--once", action="store_true", help="run one trade cycle and exit")
     parser.add_argument("--no-reflection", action="store_true", help="disable reflection loop")
@@ -297,6 +300,14 @@ def main():
         log.info("   mode: %s", " ".join(mode_bits))
     if not args.no_trade:
         log.info("   strategy=%s amount=$%.1f interval=%ds", args.strategy, args.amount, args.interval)
+        # Friendly heads-up so a new user knows the worst case before walking away.
+        max_per_hour = max(1, int(3600 / max(args.interval, 1)))
+        max_per_day = max_per_hour * 24
+        log.info("   ~ at most %d trades/hour, %d/day; %s$%.2f at risk per trade",
+                 max_per_hour, max_per_day,
+                 "up to " if args.amount > 1.0 else "", args.amount)
+        log.info("   stop anytime:  aime stop      (or send SIGTERM)")
+        log.info("   chat-only:     aime start --no-trade")
     log.info("   LLM provider: %s", os.getenv("AIME_LLM_PROVIDER", "stub"))
 
     # Reflection loop
