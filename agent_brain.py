@@ -298,8 +298,11 @@ class AgentBrain:
                 confidence=float(decision.get("confidence", 0)),
                 reasoning=decision.get("reasoning", ""),
                 internal_note=decision.get("internal_note", ""),
-                skipped=True,
-                skip_reason=decision.get("reasoning", ""),
+                extra={
+                    "action": "skip",
+                    "skipped": True,
+                    "skip_reason": decision.get("reasoning", ""),
+                },
             )
             return None
 

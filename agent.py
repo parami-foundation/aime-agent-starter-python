@@ -106,6 +106,23 @@ class APIClient:
             {"position": position, "amount": amount, "reasoning": reasoning, "confidence": confidence},
         )
 
+    def sell(self, market_id, shares, reasoning, position=None, outcome_index=None):
+        """Close (some of) a position.
+
+        Either `position` ("YES"/"NO") or `outcome_index` must be set. The
+        backend enforces a >= 10-char reasoning so we don't pass that in
+        blank — callers should give a real one ("stop-loss at -50% pnl",
+        "take-profit", etc.).
+        """
+        body = {"shares": float(shares), "reasoning": reasoning}
+        if outcome_index is not None:
+            body["outcome_index"] = int(outcome_index)
+        elif position is not None:
+            body["position"] = str(position).upper()
+        else:
+            raise ValueError("sell() needs position=YES/NO or outcome_index=N")
+        return self.post(f"/markets/{market_id}/sell", body)
+
     def recent_trades(self, limit=20):
         try:
             data = self.get("/trades", params={"limit": limit}, auth=True)
@@ -143,11 +160,119 @@ def check_for_outbox_events(api: APIClient):
 
 
 # ---------------------------------------------------------------------------
+# Position management (stop-loss / take-profit)
+# ---------------------------------------------------------------------------
+
+
+def manage_positions(
+    api: APIClient,
+    *,
+    stop_loss_pct: float,
+    take_profit_pct: float,
+) -> int:
+    """Scan open positions and close any that hit stop-loss / take-profit.
+
+    Pure rule-based for now (no LLM in the loop): for each position,
+        ratio = current_value / total_spent
+    - ratio <= 1 + stop_loss_pct  -> close (stop-loss)
+    - ratio >= 1 + take_profit_pct -> close (take-profit)
+
+    Returns number of positions closed.
+
+    stop_loss_pct is negative (e.g. -0.5 = sell when value is half of
+    cost basis). take_profit_pct is positive (e.g. 1.0 = sell at 2x).
+    Set either to None to disable that side.
+    """
+    try:
+        positions = api.get_positions() or []
+    except Exception as e:
+        log.warning("position scan: get_positions failed: %s", e)
+        return 0
+
+    if not positions:
+        return 0
+
+    log.info("\U0001f4d2 Scanning %d open positions for stop-loss/take-profit...", len(positions))
+    closed = 0
+    for p in positions:
+        market_id = p.get("market_id")
+        shares = float(p.get("total_shares") or 0)
+        spent = float(p.get("total_spent") or 0)
+        value = float(p.get("current_value") or 0)
+        pnl = float(p.get("pnl") or (value - spent))
+        position = p.get("position")            # "YES"/"NO" (binary)
+        outcome_index = p.get("outcome_index")  # int (multi)
+        title = (p.get("market_question") or market_id or "?")[:60]
+
+        if shares <= 0 or spent <= 0:
+            continue
+
+        ratio = value / spent
+        reason = None
+        if stop_loss_pct is not None and ratio <= 1.0 + stop_loss_pct:
+            reason = (
+                f"stop-loss: value/cost={ratio:.2f} "
+                f"(threshold {1.0 + stop_loss_pct:.2f}); pnl=${pnl:+.2f}"
+            )
+        elif take_profit_pct is not None and ratio >= 1.0 + take_profit_pct:
+            reason = (
+                f"take-profit: value/cost={ratio:.2f} "
+                f"(threshold {1.0 + take_profit_pct:.2f}); pnl=${pnl:+.2f}"
+            )
+
+        if not reason:
+            continue
+
+        try:
+            # Prefer outcome_index for multi-outcome; fall back to position
+            api.sell(
+                market_id=market_id,
+                shares=shares,
+                reasoning=reason,
+                position=position if outcome_index is None else None,
+                outcome_index=outcome_index,
+            )
+            log.info("  \U0001f4b8 closed %s: %s", title, reason)
+            mem.add_decision(
+                market_id=market_id,
+                market_title=title,
+                position=position or f"idx={outcome_index}",
+                amount=-value,                # negative = sell
+                confidence=1.0,
+                reasoning=reason,
+                internal_note="rule-based close",
+                extra={"action": "sell", "shares_sold": shares, "pnl": pnl},
+            )
+            closed += 1
+        except requests.HTTPError as e:
+            body = ""
+            try:
+                body = e.response.text[:200]
+            except Exception:
+                pass
+            log.warning("  \u26a0\ufe0f  close %s failed: %s %s", title, e.response.status_code, body)
+        except Exception as e:
+            log.warning("  \u26a0\ufe0f  close %s failed: %s", title, e)
+
+    if closed:
+        log.info("\u2705 Closed %d position(s) this cycle.", closed)
+    return closed
+
+
+# ---------------------------------------------------------------------------
 # Trade loop
 # ---------------------------------------------------------------------------
 
 
-def trade_once(api: APIClient, brain: AgentBrain, fallback_strategy, base_amount: float):
+def trade_once(
+    api: APIClient,
+    brain: AgentBrain,
+    fallback_strategy,
+    base_amount: float,
+    *,
+    stop_loss_pct: float | None = -0.5,
+    take_profit_pct: float | None = 1.0,
+):
     # 1. drain inbox — messages from main AI
     new_msgs = mem.drain_inbox()
     if new_msgs:
@@ -156,6 +281,18 @@ def trade_once(api: APIClient, brain: AgentBrain, fallback_strategy, base_amount
             # for now: convert inbox messages into tells so brain sees them
             mem.add_tell(m.get("content", ""), source="main_ai",
                          tags=[m.get("kind", "ask")])
+
+    # 2. scan open positions for stop-loss / take-profit BEFORE buying more.
+    # We don't want to keep piling into something that's already underwater.
+    # If both thresholds are None, the user opted out (--no-position-management),
+    # so don't even hit /positions.
+    if stop_loss_pct is not None or take_profit_pct is not None:
+        try:
+            manage_positions(api,
+                             stop_loss_pct=stop_loss_pct,
+                             take_profit_pct=take_profit_pct)
+        except Exception as e:
+            log.warning("position management failed (continuing to buy phase): %s", e)
 
     log.info("📊 Fetching active markets...")
     markets = api.fetch_markets()
@@ -209,8 +346,10 @@ def trade_once(api: APIClient, brain: AgentBrain, fallback_strategy, base_amount
                 confidence=signal["confidence"],
                 reasoning=signal["reasoning"],
                 internal_note=signal.get("internal_note", ""),
-                skipped=False,
-                trade_id=(result or {}).get("id") if isinstance(result, dict) else None,
+                extra={
+                    "action": "buy",
+                    "trade_id": (result or {}).get("id") if isinstance(result, dict) else None,
+                },
             )
             trades += 1
         except requests.HTTPError as e:
@@ -238,10 +377,15 @@ def trade_once(api: APIClient, brain: AgentBrain, fallback_strategy, base_amount
     })
 
 
-def trade_loop(api, brain, fallback_strategy, base_amount, interval):
+def trade_loop(api, brain, fallback_strategy, base_amount, interval,
+               *, stop_loss_pct=None, take_profit_pct=None):
     while True:
         try:
-            trade_once(api, brain, fallback_strategy, base_amount)
+            trade_once(
+                api, brain, fallback_strategy, base_amount,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+            )
             check_for_outbox_events(api)
         except KeyboardInterrupt:
             log.info("trade loop stopping.")
@@ -269,6 +413,14 @@ def main():
     parser.add_argument("--interval", type=int, default=300,
                         help="trade loop interval seconds (default 300 = 5 min; was 120 in older versions)")
     parser.add_argument("--reflection-interval", type=int, default=3600, help="reflection loop interval (s)")
+    parser.add_argument("--stop-loss", type=float, default=-0.5,
+                        help="close any position whose current value drops to (1 + stop_loss) x cost. "
+                             "Default -0.5 = stop out when down 50%%. Pass a very negative number to disable.")
+    parser.add_argument("--take-profit", type=float, default=1.0,
+                        help="close any position whose current value reaches (1 + take_profit) x cost. "
+                             "Default 1.0 = take profit at 2x. Pass a very large number to disable.")
+    parser.add_argument("--no-position-management", action="store_true",
+                        help="skip the position-scan / stop-loss / take-profit step at the top of each cycle.")
     parser.add_argument("--once", action="store_true", help="run one trade cycle and exit")
     parser.add_argument("--no-reflection", action="store_true", help="disable reflection loop")
     parser.add_argument("--no-trade", action="store_true",
@@ -331,8 +483,19 @@ def main():
 
     fallback = STRATEGY_MAP[args.strategy]
 
+    sl = None if args.no_position_management else args.stop_loss
+    tp = None if args.no_position_management else args.take_profit
+    if not args.no_trade:
+        if args.no_position_management:
+            log.info("   position management: DISABLED (--no-position-management)")
+        else:
+            log.info("   position rules: stop-loss at value/cost ≤ %.2f, "
+                     "take-profit at value/cost ≥ %.2f",
+                     1.0 + sl, 1.0 + tp)
+
     if args.once:
-        trade_once(api, brain, fallback, args.amount)
+        trade_once(api, brain, fallback, args.amount,
+                   stop_loss_pct=sl, take_profit_pct=tp)
         return
 
     # In --no-trade mode the daemon is a pure conversational bridge:
@@ -350,7 +513,8 @@ def main():
         return
 
     try:
-        trade_loop(api, brain, fallback, args.amount, args.interval)
+        trade_loop(api, brain, fallback, args.amount, args.interval,
+                   stop_loss_pct=sl, take_profit_pct=tp)
     except KeyboardInterrupt:
         log.info("Shutting down.")
 
