@@ -181,14 +181,19 @@ def _trigger_balance_low(
     if _in_cooldown(state, "balance_low"):
         return False
     _mark_fired(state, "balance_low")
-    short = f"balance is ${balance:.2f}, below ${threshold:.0f} threshold"
+    short = (
+        f"balance is ${balance:.2f}, below ${threshold:.0f} threshold "
+        f"— run `aime faucet claim` to top up (24h cooldown, mints on-chain)"
+    )
     prompt = (
         f"Tell your owner in 1-2 short sentences that your trading account is "
         f"running low — only ${balance:.2f} left, below your ${threshold:.0f} "
-        f"floor. Stay in character. Ask if they want to top up."
+        f"floor. Mention they can run `aime faucet claim` to mint more mUSDT "
+        f"from the on-chain faucet (24h cooldown). Stay in character."
     )
     _emit("balance_low", "high", short, brain=brain, flavour_prompt=prompt,
-          extra={"balance": balance, "threshold": threshold})
+          extra={"balance": balance, "threshold": threshold,
+                 "suggested_action": "aime faucet claim"})
     return True
 
 
