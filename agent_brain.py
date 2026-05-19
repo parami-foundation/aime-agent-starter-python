@@ -55,20 +55,35 @@ class AgentBrain:
         self.agent_name = agent_name
         self.api = api_client
         self.personality = mem.load_personality()
+        # cache for chat-path API calls so each `aime ask`/`mood`/`debate`
+        # doesn't re-hit the backend (huge latency win on slow networks /
+        # 401 retries during testing)
+        self._cache = {"balance": None, "positions": None, "ts": 0.0}
+        self._cache_ttl = 30.0
+
+    def invalidate_cache(self) -> None:
+        self._cache["ts"] = 0.0
 
     # ------------------------------------------------------------------
     # State snapshot
     # ------------------------------------------------------------------
 
     def _stats(self) -> dict:
-        try:
-            balance = self.api.get_balance()
-        except Exception:
-            balance = None
-        try:
-            positions = self.api.get_positions()
-        except Exception:
-            positions = []
+        # Use cached balance/positions if fresh (chat path hits this hot).
+        now = time.time()
+        if now - self._cache["ts"] < self._cache_ttl and self._cache["ts"] > 0:
+            balance = self._cache["balance"]
+            positions = self._cache["positions"] or []
+        else:
+            try:
+                balance = self.api.get_balance()
+            except Exception:
+                balance = None
+            try:
+                positions = self.api.get_positions()
+            except Exception:
+                positions = []
+            self._cache = {"balance": balance, "positions": positions, "ts": now}
         tells = mem.recent_tells(hours=48)
         last_tell = max((t.get("ts", 0) for t in tells), default=0)
         hours_since_tell = (time.time() - last_tell) / 3600 if last_tell else 999

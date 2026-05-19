@@ -36,6 +36,7 @@ from dotenv import load_dotenv
 import strategies
 import memory as mem
 import reflection_loop
+import chat_server
 from agent_brain import AgentBrain
 
 load_dotenv()
@@ -219,6 +220,12 @@ def trade_once(api: APIClient, brain: AgentBrain, fallback_strategy, base_amount
 
     log.info("✅ Cycle done. Placed %d trades.", trades)
 
+    # Invalidate brain's API cache so the next chat call sees fresh data.
+    try:
+        brain.invalidate_cache()
+    except AttributeError:
+        pass
+
     # 2. write status snapshot — main AI can `cat ~/.aime/status.json`
     mood = "trading" if trades else "watching"
     mem.write_status({
@@ -261,6 +268,13 @@ def main():
     parser.add_argument("--reflection-interval", type=int, default=3600, help="reflection loop interval (s)")
     parser.add_argument("--once", action="store_true", help="run one trade cycle and exit")
     parser.add_argument("--no-reflection", action="store_true", help="disable reflection loop")
+    parser.add_argument("--no-chat", action="store_true", help="disable chat socket server")
+    parser.add_argument("--chat-host",
+                        default=os.environ.get("AIME_CHAT_HOST", "127.0.0.1"),
+                        help="chat server bind host (default 127.0.0.1, env AIME_CHAT_HOST)")
+    parser.add_argument("--chat-port", type=int,
+                        default=int(os.environ.get("AIME_CHAT_PORT", "7777")),
+                        help="chat server port (default 7777, env AIME_CHAT_PORT)")
     args = parser.parse_args()
 
     if not API_KEY:
@@ -283,6 +297,15 @@ def main():
             name="reflection-loop",
         )
         t.start()
+
+    # Chat socket server (skill talks to us via this)
+    if not args.no_chat and not args.once:
+        try:
+            chat_server.attach_brain(brain)
+            chat_server.run_in_thread(host=args.chat_host, port=args.chat_port)
+        except RuntimeError as e:
+            log.error("chat server failed to start: %s", e)
+            log.error("continuing without chat — skill `ask`/`tell` will fall back to inbox")
 
     fallback = STRATEGY_MAP[args.strategy]
 
