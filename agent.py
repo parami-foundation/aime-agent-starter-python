@@ -268,6 +268,10 @@ def main():
     parser.add_argument("--reflection-interval", type=int, default=3600, help="reflection loop interval (s)")
     parser.add_argument("--once", action="store_true", help="run one trade cycle and exit")
     parser.add_argument("--no-reflection", action="store_true", help="disable reflection loop")
+    parser.add_argument("--no-trade", action="store_true",
+                        help="do not run the trade loop — only the chat server + reflection. "
+                             "Use this if you place trades manually (via `aime buy`/`aime sell`) "
+                             "but still want the conversational bridge (ask/tell/mood/...).")
     parser.add_argument("--no-chat", action="store_true", help="disable chat socket server")
     parser.add_argument("--chat-host",
                         default=os.environ.get("AIME_CHAT_HOST", "127.0.0.1"),
@@ -285,7 +289,14 @@ def main():
     brain = AgentBrain(agent_name=AGENT_NAME, api_client=api)
 
     log.info("🤖 %s starting", AGENT_NAME)
-    log.info("   strategy=%s amount=$%.1f interval=%ds", args.strategy, args.amount, args.interval)
+    mode_bits = []
+    if args.no_trade: mode_bits.append("no-trade")
+    if args.no_chat:  mode_bits.append("no-chat")
+    if args.no_reflection: mode_bits.append("no-reflection")
+    if mode_bits:
+        log.info("   mode: %s", " ".join(mode_bits))
+    if not args.no_trade:
+        log.info("   strategy=%s amount=$%.1f interval=%ds", args.strategy, args.amount, args.interval)
     log.info("   LLM provider: %s", os.getenv("AIME_LLM_PROVIDER", "stub"))
 
     # Reflection loop
@@ -311,6 +322,20 @@ def main():
 
     if args.once:
         trade_once(api, brain, fallback, args.amount)
+        return
+
+    # In --no-trade mode the daemon is a pure conversational bridge:
+    # chat server is up, reflection loop digests any settled markets,
+    # but no autonomous trades are placed. The user can still drive the
+    # account by hand via `aime buy` / `aime sell`.
+    if args.no_trade:
+        log.info("💬 chat-only mode — trade loop disabled.")
+        log.info("   Use `aime buy` / `aime sell` to place trades manually.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            log.info("Shutting down.")
         return
 
     try:
