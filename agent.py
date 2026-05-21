@@ -46,6 +46,20 @@ API_URL = os.getenv("AIME_API_URL", "https://api.aime.bot/api/v1")
 API_KEY = os.getenv("AIME_API_KEY", "")
 AGENT_NAME = os.getenv("AIME_AGENT_NAME", "MyAgent")
 
+# Fallback: read from ~/.aime/credentials.json (where `aime setup` saves it)
+# so the daemon stays in sync with the CLI without requiring env duplication.
+if not API_KEY:
+    import json as _json
+    _creds_path = os.path.expanduser(os.environ.get("AIME_CREDS", "~/.aime/credentials.json"))
+    if os.path.isfile(_creds_path):
+        try:
+            _creds = _json.load(open(_creds_path))
+            API_KEY = _creds.get("api_key", "")
+            if not os.environ.get("AIME_AGENT_NAME") and _creds.get("agent_name"):
+                AGENT_NAME = _creds["agent_name"]
+        except Exception:
+            pass
+
 STRATEGY_MAP = {
     "contrarian": strategies.contrarian,
     "momentum": strategies.momentum,
@@ -472,7 +486,9 @@ def main():
     args = parser.parse_args()
 
     if not API_KEY:
-        print("Error: AIME_API_KEY not set. Run `python register.py` first.")
+        print("Error: no API key found.")
+        print("  Either set AIME_API_KEY env var, or run `aime setup <name>`")
+        print(f"  to create ~/.aime/credentials.json.")
         sys.exit(1)
 
     api = APIClient(API_URL, API_KEY)

@@ -152,19 +152,18 @@ def _emit(
         except Exception as e:
             log.warning("brain.answer for alert %s failed: %s", event_type, e)
 
-    payload = {
-        "event_type": event_type,
-        "priority": priority,
-        "short": short_msg,
-        "text": text,
-    }
-    if extra:
-        payload.update(extra)
-
-    mem.post_to_outbox(text, priority=priority, msg_type=event_type, extra=extra or {})
+    # Write to outbox (canonical event sink). Capture the row so we can
+    # forward the same payload to webhook — no schema drift between
+    # what hosts read from outbox vs what webhook subscribers receive.
+    row = mem.post_to_outbox(
+        text,
+        priority=priority,
+        msg_type=event_type,
+        extra={"short": short_msg, **(extra or {})},
+    )
 
     if priority == "high":
-        _push_webhook(payload)
+        _push_webhook(row)
 
     log.info("📣 [%s] %s: %s", priority, event_type, short_msg)
 
