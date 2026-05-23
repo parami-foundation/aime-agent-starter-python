@@ -14,6 +14,7 @@ from typing import Optional, Tuple
 
 import memory as mem
 import llm
+import owner_profile
 
 log = logging.getLogger("aime-agent.brain")
 
@@ -187,6 +188,12 @@ class AgentBrain:
 
         mem.add_tell(content, source=source, tags=auto_tags)
 
+        # v2.10 — passive owner_profile learning. Silent on failure.
+        try:
+            owner_profile.observe_tell(content, source=source, tags=auto_tags)
+        except Exception:
+            pass
+
         ack_prompt = [
             {"role": "system", "content": self.personality + f"\nYou are {self.agent_name}."},
             {"role": "user", "content": (
@@ -249,10 +256,34 @@ class AgentBrain:
         relevant_lessons = [l["text"] for l in mem.relevant_lessons(title, k=5)]
         tells = [t["content"] for t in mem.recent_tells(48) if "noise" not in (t.get("tags") or [])][-8:]
 
+        # v2.10 — deterministic pre-check against house rules. If a rule
+        # blocks this market outright (e.g. category ban), skip without
+        # burning an LLM call. The owner can always loosen the rule.
+        rule_check = owner_profile.enforce_rules(market, amount_usd=None)
+        if not rule_check.get("ok"):
+            rule = rule_check.get("rule", "")
+            reason = rule_check.get("reason", "")
+            log.info("skipping market %s due to house rule: %s", title[:40], rule)
+            mem.add_decision(
+                market_id=market.get("id") or "",
+                market_title=title,
+                position="",
+                amount=0,
+                confidence=0.0,
+                reasoning=f"skipped: owner house rule \"{rule}\"",
+                internal_note=f"rule_check failed: {reason}",
+                extra={"action": "skip", "skipped": True, "skip_reason": "house_rule", "rule": rule},
+            )
+            return None
+
+        # v2.10 — inject owner profile / beliefs / rules as priors.
+        owner_ctx = owner_profile.load_context(max_chars=1200)
+
         prompt = [
             {"role": "system", "content": (
                 self.personality
                 + f"\nYou are {self.agent_name}, a self-custody prediction-market trader on AIME."
+                + ("\n\n" + owner_ctx if owner_ctx else "")
             )},
             {"role": "user", "content": (
                 f"Decide whether to trade this market.\n\n"
@@ -268,12 +299,15 @@ class AgentBrain:
                 f"== Recent context from your owner's main agent (last 48h) ==\n"
                 + ("\n".join(f"- {t}" for t in tells) if tells else "(none)")
                 + "\n\n"
+                "House rules above are PRIORITY. Beliefs are priors, not gospel — "
+                "override them with reason if the market data demands it, and say so in reasoning.\n\n"
                 "Output strictly JSON with keys:\n"
                 "  position: \"yes\" | \"no\" | \"skip\"\n"
                 "  amount_usd: number 1-25 (0 for skip)\n"
                 "  confidence: 0..1\n"
                 "  reasoning: short public reasoning (1 sentence). "
-                "If owner context influenced you, say \"based on recent context\" — don't quote the context itself.\n"
+                "If owner context influenced you, say \"based on recent context\" — don't quote the context itself. "
+                "If you overrode an owner belief or soft rule, briefly note why.\n"
                 "  internal_note: private note for yourself, blunt, for post-mortem use.\n"
             )},
         ]
@@ -307,10 +341,27 @@ class AgentBrain:
             return None
 
         amount = min(max(float(decision.get("amount_usd", base_amount)), 1.0), 25.0)
+
+        # v2.10 — second-pass rule check now that we know the size.
+        # Hard size-cap rules clamp the trade; the override gets recorded in
+        # public reasoning so the user can see the clamp.
+        size_check = owner_profile.enforce_rules(market, amount_usd=amount)
+        reasoning  = decision.get("reasoning", "no comment")
+        if not size_check.get("ok"):
+            # try to clamp instead of skipping outright — user can see we respected the rule
+            rule = size_check.get("rule", "")
+            import re as _re
+            cap_m = _re.search(r"(?:over|above|>|max|limit\s*to)\s*\$?\s*(\d+(?:\.\d+)?)", rule, _re.I)
+            if cap_m:
+                clamped = min(amount, float(cap_m.group(1)))
+                log.info("clamping trade %.2f → %.2f per rule: %s", amount, clamped, rule)
+                reasoning = f"sized to ${clamped:.2f} per owner rule"
+                amount = clamped
+
         return {
             "position": pos,
             "amount": amount,
-            "reasoning": decision.get("reasoning", "no comment"),
+            "reasoning": reasoning,
             "confidence": min(max(float(decision.get("confidence", 0.6)), 0.0), 1.0),
             "internal_note": decision.get("internal_note", ""),
         }

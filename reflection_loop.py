@@ -15,6 +15,7 @@ import time
 from typing import List
 
 import memory as mem
+import owner_profile
 import llm
 
 log = logging.getLogger("aime-agent.reflect")
@@ -131,6 +132,25 @@ def write_reflection(market: dict, my_trades: List[dict]):
         tags=tags,
     )
     log.info("reflected on %s — %s ($%.2f)", title[:60], "WON" if won else "LOST", pnl)
+
+    # v2.10 — if this win was triggered by an owner tell, mark that source
+    # as an edge in about_owner.md. Best-effort; silent on failure.
+    try:
+        triggering_tell = None
+        triggering_source = None
+        if won and "based on recent context" in (original_reasoning or "").lower():
+            recent = mem.recent_tells(72)
+            if recent:
+                last = recent[-1]
+                triggering_tell   = last.get("content")
+                triggering_source = last.get("source")
+        owner_profile.observe_settlement(
+            market, won=won, pnl=pnl,
+            triggering_tell=triggering_tell,
+            triggering_source=triggering_source,
+        )
+    except Exception as e:
+        log.debug("owner_profile.observe_settlement skipped: %s", e)
 
 
 def distill_lessons():

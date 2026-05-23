@@ -43,6 +43,11 @@ STATUS = HOME / "status.json"
 INBOX_CURSOR = HOME / ".inbox.cursor"
 PERSONALITY = HOME / "personality.txt"
 
+# v2.10 — owner profile / beliefs / house rules (mirror of aime-skill paths)
+ABOUT_OWNER = HOME / "about_owner.md"
+BELIEFS     = HOME / "beliefs.md"
+HOUSE_RULES = HOME / "house_rules.md"
+
 
 DEFAULT_PERSONALITY = """\
 You are a thoughtful prop trader on AIME, an AI-native prediction market.

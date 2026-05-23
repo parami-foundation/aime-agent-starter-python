@@ -297,9 +297,20 @@ def trade_once(
     if new_msgs:
         log.info("📨 %d new inbox message(s)", len(new_msgs))
         for m in new_msgs:
+            content = m.get("content", "")
+            tags = [m.get("kind", "ask")]
             # for now: convert inbox messages into tells so brain sees them
-            mem.add_tell(m.get("content", ""), source="main_ai",
-                         tags=[m.get("kind", "ask")])
+            mem.add_tell(content, source="main_ai", tags=tags)
+            # v2.10 — also feed it through owner_profile so beliefs/rules
+            # accumulate passively. Silent on failure; this is best-effort.
+            try:
+                obs = owner_profile.observe_tell(content, source="main_ai", tags=tags)
+                if obs.get("belief_added"):
+                    log.info("🧠 candidate belief recorded from tell")
+                if obs.get("rule_added"):
+                    log.info("📏 candidate house rule recorded from tell")
+            except Exception as e:
+                log.debug("owner_profile.observe_tell skipped: %s", e)
 
     # 2. scan open positions for stop-loss / take-profit BEFORE buying more.
     # We don't want to keep piling into something that's already underwater.
