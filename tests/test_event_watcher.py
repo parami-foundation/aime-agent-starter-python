@@ -231,3 +231,116 @@ def test_disabled_flag_means_no_fires(tmp_path, monkeypatch):
     n = ew.check_all(balance=5, brain=None, enabled=False)
     assert n == 0
     assert _read_outbox(home) == []
+
+
+# ---------------------------------------------------------------------------
+# Delivery guarantees (the "missed notification" fixes)
+# ---------------------------------------------------------------------------
+
+def test_quiet_hours_still_writes_outbox(tmp_path, monkeypatch):
+    """Quiet hours must DEFER the push, never DROP the outbox record."""
+    home = _fresh_home(tmp_path, monkeypatch)
+    import event_watcher as ew
+
+    # Force quiet hours
+    monkeypatch.setattr(ew, "_is_quiet_hours", lambda: True)
+    state = {}
+    ew._emit(state, "profit_milestone", "info", "up 10%", brain=None)
+    out = _read_outbox(home)
+    assert any(o["msg_type"] == "profit_milestone" for o in out), \
+        "info event during quiet hours must still land in outbox"
+
+
+def test_all_priorities_push_webhook(tmp_path, monkeypatch):
+    """Not just high — info/low must hit the webhook too (no-poll agents)."""
+    home = _fresh_home(tmp_path, monkeypatch)
+    import event_watcher as ew
+
+    pushed = []
+    monkeypatch.setattr(ew, "_is_quiet_hours", lambda: False)
+    monkeypatch.setattr(ew, "_push_webhook", lambda row: pushed.append(row) or True)
+    state = {}
+    ew._emit(state, "winning_streak", "info", "3 wins", brain=None)
+    ew._emit(state, "note", "low", "fyi", brain=None)
+    assert len(pushed) == 2, "info and low events should both be pushed"
+
+
+def test_webhook_failure_queues_for_retry(tmp_path, monkeypatch):
+    home = _fresh_home(tmp_path, monkeypatch)
+    import event_watcher as ew
+
+    monkeypatch.setenv("AIME_WEBHOOK_URL", "http://example.test/hook")
+    monkeypatch.setattr(ew, "_is_quiet_hours", lambda: False)
+    monkeypatch.setattr(ew, "_push_webhook", lambda row: False)  # always fail
+    state = {}
+    ew._emit(state, "balance_low", "high", "low bal", brain=None)
+    assert len(state.get("webhook_retry_queue", [])) == 1, \
+        "failed push must be queued for retry"
+
+
+def test_retry_queue_flushes_when_webhook_recovers(tmp_path, monkeypatch):
+    home = _fresh_home(tmp_path, monkeypatch)
+    import event_watcher as ew
+
+    monkeypatch.setenv("AIME_WEBHOOK_URL", "http://example.test/hook")
+    monkeypatch.setattr(ew, "_is_quiet_hours", lambda: False)
+    delivered = []
+    state = {"webhook_retry_queue": [{"id": "x", "priority": "high", "msg": "q"}]}
+    monkeypatch.setattr(ew, "_push_webhook", lambda row: delivered.append(row) or True)
+    ew._flush_webhook_retry_queue(state)
+    assert delivered, "queued event should be redelivered on recovery"
+    assert not state["webhook_retry_queue"], "queue should drain on success"
+
+
+def test_quiet_hours_defers_non_high_push_but_keeps_high(tmp_path, monkeypatch):
+    home = _fresh_home(tmp_path, monkeypatch)
+    import event_watcher as ew
+
+    monkeypatch.setenv("AIME_WEBHOOK_URL", "http://example.test/hook")
+    monkeypatch.setattr(ew, "_is_quiet_hours", lambda: True)
+    pushed = []
+    monkeypatch.setattr(ew, "_push_webhook", lambda row: pushed.append(row) or True)
+    state = {}
+    ew._emit(state, "drawdown", "high", "down 20%", brain=None)   # high -> push now
+    ew._emit(state, "winning_streak", "info", "3 wins", brain=None)  # info -> defer
+    assert len(pushed) == 1 and pushed[0]["priority"] == "high"
+    assert len(state.get("webhook_retry_queue", [])) == 1, \
+        "deferred info event should be queued for after quiet hours"
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat trigger (the "state opacity" fix)
+# ---------------------------------------------------------------------------
+
+def test_heartbeat_fires_when_due_and_respects_interval(tmp_path, monkeypatch):
+    home = _fresh_home(tmp_path, monkeypatch)
+    import event_watcher as ew
+    import memory as mem
+
+    monkeypatch.setattr(ew, "_is_quiet_hours", lambda: False)
+    mem.write_status({"balance": 1234.5, "strategy": "momentum", "mood": "calm"})
+
+    state = {}
+    fired = ew._trigger_heartbeat(state, 1234.5, ew.DEFAULT_HB_SIGNAL_INTERVAL, None)
+    assert fired is True
+    out = _read_outbox(home)
+    assert any(o["msg_type"] == "heartbeat" for o in out)
+
+    # Within interval: should not fire again
+    fired2 = ew._trigger_heartbeat(state, 1234.5, ew.DEFAULT_HB_SIGNAL_INTERVAL, None)
+    assert fired2 is False
+
+
+def test_heartbeat_quiet_hours_resets_timer_without_emitting(tmp_path, monkeypatch):
+    home = _fresh_home(tmp_path, monkeypatch)
+    import event_watcher as ew
+
+    monkeypatch.setattr(ew, "_is_quiet_hours", lambda: True)
+    state = {}
+    fired = ew._trigger_heartbeat(state, 100.0, ew.DEFAULT_HB_SIGNAL_INTERVAL, None)
+    assert fired is False
+    out = _read_outbox(home)
+    assert not any(o.get("msg_type") == "heartbeat" for o in out), \
+        "heartbeat should be silent during quiet hours"
+    assert state.get("last_fired", {}).get("heartbeat"), \
+        "timer should still advance so we don't backlog at 08:00"

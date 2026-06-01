@@ -1,11 +1,19 @@
 """
-event_watcher.py — 8 built-in triggers that decide when the agent should
+event_watcher.py — built-in triggers that decide when the agent should
 proactively report to the owner.
 
 Pets talk. So does this one. After every trade cycle, the watcher checks
-8 rules; any that fire write a message to the outbox (with personality-
-flavoured text from the brain), and high-priority ones also POST to
-AIME_WEBHOOK_URL if set.
+its rules; any that fire write a message to the outbox (with personality-
+flavoured text from the brain) and POST to AIME_WEBHOOK_URL if set.
+
+Delivery is best-effort-but-never-silently-dropped:
+  * The outbox is the canonical sink — every event is written there
+    regardless of priority or quiet hours.
+  * Every priority is pushed to the webhook (not just high), so an agent
+    with no polling host still reaches its owner.
+  * Quiet hours (23:00–08:00) defer non-high pushes; they're queued and
+    flushed after 08:00, never dropped.
+  * Failed/deferred pushes go to a retry queue and re-send next cycle.
 
 Rules:
   1. balance_low          : free balance < threshold (default $50)
@@ -16,6 +24,8 @@ Rules:
   6. winning_streak       : 3 wins in a row
   7. market_settled       : a market we participated in just resolved
   8. owner_intel_paid_off : a tell-influenced trade settled green
+  9. heartbeat             : periodic "alive + status" digest (default 6h),
+                            so a quietly-trading agent never goes dark
 
 State (peak balance, fired thresholds, cooldown timestamps, etc.) lives
 in ~/.aime/alerts_state.json so the watcher remembers across restarts.
@@ -112,15 +122,41 @@ def _is_quiet_hours() -> bool:
 # Webhook
 # ---------------------------------------------------------------------------
 
-def _push_webhook(event: dict) -> None:
+def _push_webhook(event: dict) -> bool:
+    """POST one event to AIME_WEBHOOK_URL. Returns True on success, False on
+    failure or when no URL is configured. Callers use the return value to
+    decide whether to queue the event for retry."""
     url = os.environ.get("AIME_WEBHOOK_URL", "").strip()
     if not url:
-        return
+        return False
     try:
         import requests
-        requests.post(url, json=event, timeout=5)
+        resp = requests.post(url, json=event, timeout=5)
+        return resp.ok
     except Exception as e:
         log.warning("webhook POST failed: %s", e)
+        return False
+
+
+def _flush_webhook_retry_queue(state: dict) -> None:
+    """Best-effort redelivery of events whose webhook POST previously failed.
+    Piggybacks on any check_all cycle so a transient outage self-heals."""
+    if not os.environ.get("AIME_WEBHOOK_URL", "").strip():
+        return
+    queue = state.get("webhook_retry_queue") or []
+    if not queue:
+        return
+    # During quiet hours, hold non-high deferrals until after 08:00.
+    quiet = _is_quiet_hours()
+    still_pending = []
+    for event in queue:
+        if quiet and (event.get("priority") != "high"):
+            still_pending.append(event)
+            continue
+        if not _push_webhook(event):
+            still_pending.append(event)
+    # Cap the queue so a long outage can't grow it unbounded.
+    state["webhook_retry_queue"] = still_pending[-50:]
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +164,7 @@ def _push_webhook(event: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _emit(
+    state: dict,
     event_type: str,
     priority: str,
     short_msg: str,
@@ -136,13 +173,21 @@ def _emit(
     flavour_prompt: Optional[str] = None,
     extra: Optional[dict] = None,
 ) -> None:
-    """Write one alert. Optionally let the brain write a personality-flavoured
-    line. Outbox always gets it; webhook gets it for high priority."""
-    quiet = _is_quiet_hours()
-    if quiet and priority != "high":
-        log.debug("quiet hours: skipping %s (priority=%s)", event_type, priority)
-        return
+    """Write one alert.
 
+    Design rules (so the owner never silently misses something):
+      * The outbox is the canonical sink — EVERY event is written to it,
+        regardless of priority or quiet hours. Quiet hours only defer the
+        *push*, never drop the record. A polling host (e.g. heartbeat)
+        will still see it later.
+      * Every priority is pushed to the webhook, not just `high`. For an
+        agent with no polling host, the webhook is the only way the owner
+        hears anything — so info/low must go out too.
+      * During quiet hours, only `high` pushes immediately; lower
+        priorities are queued and flushed after 08:00 by the retry queue.
+      * Webhook failures are queued and retried next cycle so a transient
+        outage self-heals instead of losing the event.
+    """
     text = short_msg
     if brain is not None and flavour_prompt:
         try:
@@ -152,9 +197,7 @@ def _emit(
         except Exception as e:
             log.warning("brain.answer for alert %s failed: %s", event_type, e)
 
-    # Write to outbox (canonical event sink). Capture the row so we can
-    # forward the same payload to webhook — no schema drift between
-    # what hosts read from outbox vs what webhook subscribers receive.
+    # 1) Always persist to outbox — no drops, ever.
     row = mem.post_to_outbox(
         text,
         priority=priority,
@@ -162,8 +205,19 @@ def _emit(
         extra={"short": short_msg, **(extra or {})},
     )
 
-    if priority == "high":
-        _push_webhook(row)
+    # 2) Push now, or defer to the retry queue.
+    has_url = bool(os.environ.get("AIME_WEBHOOK_URL", "").strip())
+    quiet = _is_quiet_hours()
+    push_now = (priority == "high") or (not quiet)
+    if push_now:
+        if not _push_webhook(row) and has_url:
+            state.setdefault("webhook_retry_queue", []).append(row)
+    else:
+        # Quiet-hours deferral for non-high: queue so it flushes after 08:00.
+        if has_url:
+            state.setdefault("webhook_retry_queue", []).append(row)
+        log.debug("quiet hours: deferred push for %s (priority=%s)",
+                  event_type, priority)
 
     log.info("📣 [%s] %s: %s", priority, event_type, short_msg)
 
@@ -190,7 +244,7 @@ def _trigger_balance_low(
         f"floor. Mention they can run `aime faucet claim` to mint more mUSDT "
         f"from the on-chain faucet (24h cooldown). Stay in character."
     )
-    _emit("balance_low", "high", short, brain=brain, flavour_prompt=prompt,
+    _emit(state, "balance_low", "high", short, brain=brain, flavour_prompt=prompt,
           extra={"balance": balance, "threshold": threshold,
                  "suggested_action": "aime faucet claim"})
     return True
@@ -223,7 +277,7 @@ def _trigger_drawdown(
         f"${peak:.2f}, now sitting at ${balance:.2f}. 1-2 sentences, honest, "
         f"in character. Don't panic, but don't brush it off."
     )
-    _emit("drawdown", "high", short, brain=brain, flavour_prompt=prompt,
+    _emit(state, "drawdown", "high", short, brain=brain, flavour_prompt=prompt,
           extra={"balance": balance, "peak": peak, "drawdown_pct": dd,
                  "threshold": biggest})
     return True
@@ -257,7 +311,7 @@ def _trigger_profit_milestone(
         f"from start. From ${start:.2f} to ${balance:.2f}. 1-2 sentences, "
         f"stay in character, don't be insufferable."
     )
-    _emit("profit_milestone", "info", short, brain=brain, flavour_prompt=prompt,
+    _emit(state, "profit_milestone", "info", short, brain=brain, flavour_prompt=prompt,
           extra={"balance": balance, "start": start, "gain_pct": gain,
                  "threshold": biggest})
     return True
@@ -286,7 +340,7 @@ def _trigger_losing_streak(state: dict, brain) -> bool:
         f"Tell your owner honestly — 1-2 sentences. Maybe propose a pause "
         f"or rethink. Stay in character."
     )
-    _emit("losing_streak", "info", short, brain=brain, flavour_prompt=prompt,
+    _emit(state, "losing_streak", "info", short, brain=brain, flavour_prompt=prompt,
           extra={"streak": 3, "cum_pnl": total_pnl})
     return True
 
@@ -306,7 +360,7 @@ def _trigger_winning_streak(state: dict, brain) -> bool:
         f"Don't pretend it's all skill (markets are noisy), but enjoy it. "
         f"1-2 sentences, in character."
     )
-    _emit("winning_streak", "info", short, brain=brain, flavour_prompt=prompt,
+    _emit(state, "winning_streak", "info", short, brain=brain, flavour_prompt=prompt,
           extra={"streak": 3, "cum_pnl": total_pnl})
     return True
 
@@ -344,7 +398,7 @@ def _trigger_market_settled(state: dict, brain) -> bool:
                 f"A market you participated in just settled. Outcome={outcome}, "
                 f"pnl=${pnl:+.2f}. Update your owner in 1 sentence."
             )
-        _emit("market_settled", "info", short, brain=brain, flavour_prompt=prompt,
+        _emit(state, "market_settled", "info", short, brain=brain, flavour_prompt=prompt,
               extra={"market_id": mid, "won": won, "pnl": pnl, "outcome": outcome})
         state.setdefault("settled_markets_seen", []).append(mid)
         fired_any = True
@@ -373,7 +427,7 @@ def _trigger_owner_intel_paid_off(state: dict, brain) -> bool:
             f"after factoring it in just settled with pnl ${pnl:+.2f}. "
             f"Thank them in 1 sentence, in character. Ask for more if it fits."
         )
-        _emit("owner_intel_paid_off", "info", short, brain=brain,
+        _emit(state, "owner_intel_paid_off", "info", short, brain=brain,
               flavour_prompt=prompt, extra={"market_id": mid, "pnl": pnl})
         state.setdefault("intel_acks_seen", []).append(mid)
     return True
@@ -400,8 +454,66 @@ def _trigger_chain_error_rate(
         f"fail ({rate*100:.0f}%). Backend or chain is probably struggling. "
         f"Tell your owner, 1 sentence, in character, calm but real."
     )
-    _emit("chain_error_rate", "high", short, brain=brain, flavour_prompt=prompt,
+    _emit(state, "chain_error_rate", "high", short, brain=brain, flavour_prompt=prompt,
           extra={"fails": fails, "total": len(recent), "rate": rate})
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat — periodic "I'm alive, here's what I'm doing" status.
+# Treats the *state opacity* problem: a quietly-trading agent that never
+# trips an alert would otherwise go completely silent. This emits a low-
+# priority digest every HEARTBEAT_INTERVAL so the owner always knows the
+# agent is up and what it's been doing — even on a zero-event day.
+# ---------------------------------------------------------------------------
+
+DEFAULT_HB_SIGNAL_INTERVAL = 6 * 3600  # 6h
+
+
+def _trigger_heartbeat(state: dict, balance: Optional[float],
+                       interval: float, brain) -> bool:
+    last = state.get("last_fired", {}).get("heartbeat", 0.0)
+    if (time.time() - last) < interval:
+        return False
+    # Quiet hours: skip the *push* path but still record so the timer
+    # resets and we don't dump a backlog at 08:00. A heartbeat is only
+    # useful fresh.
+    if _is_quiet_hours():
+        _mark_fired(state, "heartbeat")
+        return False
+    _mark_fired(state, "heartbeat")
+
+    # Pull a snapshot from status.json (written each cycle by the daemon).
+    try:
+        status = mem.read_status()
+    except Exception:
+        status = {}
+    bal = balance if balance is not None else status.get("balance")
+    bal_s = f"${bal:,.2f}" if isinstance(bal, (int, float)) else str(bal)
+    strat = status.get("strategy", "-")
+    mood = status.get("mood", "-")
+
+    # Today's trade tally from reflections (settled outcomes).
+    refl = mem.recent_reflections(limit=50)
+    day_ago = time.time() - 24 * 3600
+    today = [r for r in refl if (r.get("ts") or 0) >= day_ago]
+    wins = sum(1 for r in today if r.get("won") is True)
+    losses = sum(1 for r in today if r.get("won") is False)
+    pnl = sum(float(r.get("pnl") or 0) for r in today)
+
+    short = (
+        f"heartbeat: alive, balance {bal_s}, strategy {strat}; "
+        f"last 24h {wins}W/{losses}L pnl ${pnl:+.2f}"
+    )
+    prompt = (
+        f"Give your owner a quick 1-2 sentence check-in: you're alive and "
+        f"trading. Balance {bal_s}, strategy '{strat}', mood '{mood}'. Last "
+        f"24h you went {wins}W/{losses}L for pnl ${pnl:+.2f}. Stay in "
+        f"character, no drama, just a friendly status ping."
+    )
+    _emit(state, "heartbeat", "low", short, brain=brain, flavour_prompt=prompt,
+          extra={"balance": bal, "strategy": strat, "wins_24h": wins,
+                 "losses_24h": losses, "pnl_24h": pnl})
     return True
 
 
@@ -430,6 +542,7 @@ def check_all(
     profit_thresholds: tuple[float, ...] = (0.1, 0.2, 0.5),
     chain_error_window: int = 10,
     chain_error_threshold: float = 0.5,
+    heartbeat_interval: float = DEFAULT_HB_SIGNAL_INTERVAL,
 ) -> int:
     """Run every trigger. Returns count of events fired this cycle."""
     if not enabled:
@@ -437,6 +550,9 @@ def check_all(
     state = _load_state()
     fired = 0
     try:
+        # First, drain any webhook events that previously failed or were
+        # deferred during quiet hours — so an outage/backlog self-heals.
+        _flush_webhook_retry_queue(state)
         if _trigger_balance_low(state, balance, balance_low_threshold, brain):
             fired += 1
         if _trigger_drawdown(state, balance, list(drawdown_thresholds), brain):
@@ -452,6 +568,8 @@ def check_all(
         if _trigger_market_settled(state, brain):
             fired += 1
         if _trigger_owner_intel_paid_off(state, brain):
+            fired += 1
+        if _trigger_heartbeat(state, balance, heartbeat_interval, brain):
             fired += 1
     finally:
         _save_state(state)

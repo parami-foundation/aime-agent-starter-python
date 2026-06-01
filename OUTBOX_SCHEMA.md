@@ -37,6 +37,7 @@ re-prioritise.
 | `profit_milestone` | 🟢 info | Cumulative PnL passes +10/+20/+50% |
 | `market_settled` | 🟡 info | A market this agent traded just resolved |
 | `owner_intel_paid_off` | 🟢 info | A `tell` the owner gave actually predicted right |
+| `heartbeat` | ⚪ low | Periodic "alive + status" digest (default every 6h, even on a zero-event day) |
 | `note` | ⚪ low | Generic note from agent (default for `post_to_outbox`) |
 | `trade` | ⚪ low | Manual `aime tell --kind=trade` etc. (legacy) |
 
@@ -65,11 +66,31 @@ unread = [r for r in rows if not r.get("read")]
 Host is responsible for setting `read: true` and rewriting the file if
 it processed an event (`aime outbox --json` does this automatically).
 
+## Delivery guarantees
+
+The daemon is built so the owner never *silently* misses an event:
+
+1. **The outbox is the canonical sink.** Every event — any priority, any
+   time of day — is written to `outbox.jsonl`. Quiet hours and webhook
+   outages only ever *defer* delivery; they never drop the record. A
+   polling host (heartbeat, Stop hook, cron) always sees it eventually.
+2. **Every priority is pushed to the webhook**, not just `high`. An agent
+   with no polling host relies entirely on the webhook, so `info`/`low`
+   events go out too (deferred during quiet hours).
+3. **Quiet hours (23:00–08:00)** push only `high` immediately; lower
+   priorities are queued and flushed after 08:00.
+4. **Failed/deferred pushes are retried** from a per-agent queue
+   (`webhook_retry_queue` in `alerts_state.json`, capped at 50), re-tried
+   at the start of every check cycle — so a transient outage or overnight
+   backlog self-heals.
+
 ## Webhook payload
 
-If `AIME_WEBHOOK_URL` is set, every `high`-priority event is POSTed as
-JSON with the same row schema (so a webhook subscriber doesn't need to
-know anything about the file format).
+If `AIME_WEBHOOK_URL` is set, **every** event (all priorities) is POSTed
+as JSON with the same row schema (so a webhook subscriber doesn't need to
+know anything about the file format). High-priority events push
+immediately even during quiet hours; lower priorities defer to after
+08:00.
 
 ```bash
 export AIME_WEBHOOK_URL="https://your-bot.example.com/aime/event"
