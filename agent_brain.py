@@ -314,3 +314,106 @@ class AgentBrain:
             "confidence": min(max(float(decision.get("confidence", 0.6)), 0.0), 1.0),
             "internal_note": decision.get("internal_note", ""),
         }
+
+    # ------------------------------------------------------------------
+    # Exit decision  (smart stop-loss / take-profit)
+    # ------------------------------------------------------------------
+
+    def decide_exit(self, position: dict, *, hit: str, ratio: float,
+                    threshold: float, hours_to_resolve: Optional[float] = None,
+                    entry: Optional[dict] = None) -> dict:
+        """LLM review of a position that tripped a stop-loss / take-profit
+        threshold.  This is the *engine* of the smart-exit chain:
+
+          - Layer 1 : LLM reviews whether to actually close or hold.
+          - Layer 3 : market time-to-resolution is fed in so 'hold to
+                      settlement vs cut now' is an explicit consideration.
+          - Layer 4 : relevant past exit lessons are retrieved and folded
+                      into the prompt (reasoning-bank reflow).
+
+        `hit` is "stop_loss" or "take_profit". Returns:
+          {action: "close"|"hold", reasoning: str, internal_note: str,
+           confidence: float}
+        On any LLM failure it falls back to the mechanical decision
+        (close), so behaviour never regresses below the old rule-based path.
+        """
+        title = (position.get("market_question") or position.get("market_id") or "?")
+        title = str(title)[:80]
+        pnl = float(position.get("pnl") or 0)
+        held = position.get("position") or (
+            f"idx={position.get('outcome_index')}" if position.get("outcome_index") is not None else "?")
+
+        # Layer 4: retrieve past exit lessons relevant to this market.
+        exit_lessons = [l["text"] for l in mem.relevant_lessons(title, k=5)]
+        # entry reasoning pairs the original thesis with the exit review.
+        entry = entry or mem.find_decision(position.get("market_id") or "")
+        entry_reasoning = (entry or {}).get("reasoning") or "(original thesis not found)"
+        entry_note = (entry or {}).get("internal_note") or ""
+
+        if hours_to_resolve is not None:
+            if hours_to_resolve <= 0:
+                time_line = "This market is at/after its resolution time — it may settle imminently."
+            elif hours_to_resolve < 6:
+                time_line = f"Resolves in ~{hours_to_resolve:.1f}h — very close to settlement."
+            elif hours_to_resolve < 48:
+                time_line = f"Resolves in ~{hours_to_resolve:.0f}h."
+            else:
+                time_line = f"Resolves in ~{hours_to_resolve/24:.0f} days — lots of time left."
+        else:
+            time_line = "Time to resolution: unknown."
+
+        kind = "stop-loss (underwater)" if hit == "stop_loss" else "take-profit (in the money)"
+
+        prompt = [
+            {"role": "system", "content": (
+                self.personality
+                + f"\nYou are {self.agent_name}, a self-custody prediction-market trader on AIME. "
+                "You are reviewing an EXISTING position that just tripped a risk threshold. "
+                "Mechanical rules would close it now; your job is to decide whether that's actually right. "
+                "Think about whether the original thesis still holds, whether new information "
+                "would change it, and whether time-to-resolution argues for holding to settlement "
+                "or cutting now."
+            )},
+            {"role": "user", "content": (
+                f"Position under review ({kind} triggered):\n"
+                f"Market: {title}\n"
+                f"You hold: {held}\n"
+                f"value/cost ratio: {ratio:.2f} (threshold {threshold:.2f})\n"
+                f"Unrealized PnL: ${pnl:+.2f}\n"
+                f"{time_line}\n\n"
+                f"== Your ORIGINAL thesis when you entered ==\n"
+                f"public: {entry_reasoning}\n"
+                f"private: {entry_note or '(none)'}\n\n"
+                f"== Past exit lessons for similar markets ==\n"
+                + ("\n".join(f"- {l}" for l in exit_lessons) if exit_lessons else "(none yet)")
+                + "\n\n"
+                "Output strictly JSON with keys:\n"
+                "  action: \"close\" | \"hold\"\n"
+                "  confidence: 0..1\n"
+                "  reasoning: 1-sentence public reasoning for the exit decision "
+                "(why close, or why hold despite the threshold).\n"
+                "  internal_note: blunt private note — did the original thesis break, "
+                "are you cutting a loser or giving a winner room, what would change your mind.\n"
+            )},
+        ]
+        decision = llm.chat_json(prompt, max_tokens=300, temperature=0.5)
+
+        if not decision or (decision.get("action") or "").lower() not in ("close", "hold"):
+            # No LLM / malformed -> fall back to the mechanical close so we
+            # never behave worse than the old rule-based path.
+            return {
+                "action": "close",
+                "confidence": 1.0,
+                "reasoning": (
+                    f"{hit.replace('_', '-')}: value/cost={ratio:.2f} "
+                    f"(threshold {threshold:.2f}); pnl=${pnl:+.2f}"
+                ),
+                "internal_note": "mechanical close (no LLM review available)",
+            }
+
+        return {
+            "action": (decision.get("action") or "close").lower(),
+            "confidence": min(max(float(decision.get("confidence", 0.6)), 0.0), 1.0),
+            "reasoning": decision.get("reasoning") or f"{hit.replace('_','-')} review",
+            "internal_note": decision.get("internal_note", ""),
+        }

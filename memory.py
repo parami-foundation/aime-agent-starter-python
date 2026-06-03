@@ -42,6 +42,7 @@ INBOX = HOME / "inbox.jsonl"
 STATUS = HOME / "status.json"
 INBOX_CURSOR = HOME / ".inbox.cursor"
 PERSONALITY = HOME / "personality.txt"
+TRAILING = HOME / "trailing.json"   # per-market peak value/cost ratio (trailing stop)
 
 
 DEFAULT_PERSONALITY = """\
@@ -212,6 +213,43 @@ def find_decision(market_id: str) -> dict | None:
         if row.get("market_id") == market_id:
             return row
     return None
+
+
+# ---------------------------------------------------------------------------
+# trailing-stop peaks: highest value/cost ratio seen per open market.
+# Used by the dynamic (trailing) stop in manage_positions. Local-only kv.
+# ---------------------------------------------------------------------------
+
+def _load_trailing() -> dict:
+    if not TRAILING.exists():
+        return {}
+    try:
+        return json.loads(TRAILING.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def get_peak_ratio(market_id: str) -> float | None:
+    v = _load_trailing().get(market_id)
+    return float(v) if v is not None else None
+
+
+def update_peak_ratio(market_id: str, ratio: float) -> float:
+    """Record a new peak if higher; return the current peak."""
+    data = _load_trailing()
+    cur = float(data.get(market_id, 0) or 0)
+    if ratio > cur:
+        data[market_id] = ratio
+        TRAILING.write_text(json.dumps(data), encoding="utf-8")
+        return ratio
+    return cur
+
+
+def clear_peak_ratio(market_id: str) -> None:
+    data = _load_trailing()
+    if market_id in data:
+        data.pop(market_id, None)
+        TRAILING.write_text(json.dumps(data), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

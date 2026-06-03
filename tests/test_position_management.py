@@ -143,3 +143,109 @@ def test_get_positions_error_does_not_raise():
             raise AssertionError("should not be called")
     closed = agent.manage_positions(BrokenAPI(), stop_loss_pct=-0.5, take_profit_pct=1.0)
     assert closed == 0
+
+
+# ---------------------------------------------------------------------------
+# Smart-exit chain (brain review + trailing stop + time-awareness)
+# ---------------------------------------------------------------------------
+
+import memory as mem  # noqa: E402
+
+
+class FakeBrain:
+    """Records decide_exit calls and returns a scripted action."""
+
+    def __init__(self, action="close", reasoning="brain says exit because thesis changed"):
+        self.action = action
+        self.reasoning = reasoning
+        self.calls = []
+
+    def decide_exit(self, position, *, hit, ratio, threshold,
+                    hours_to_resolve=None, entry=None):
+        self.calls.append({
+            "market_id": position.get("market_id"),
+            "hit": hit,
+            "ratio": ratio,
+            "threshold": threshold,
+            "hours_to_resolve": hours_to_resolve,
+        })
+        return {
+            "action": self.action,
+            "confidence": 0.8,
+            "reasoning": self.reasoning,
+            "internal_note": "scripted",
+        }
+
+
+def _clear_trailing():
+    mem.TRAILING.unlink(missing_ok=True)
+
+
+def test_brain_hold_keeps_position_open():
+    """L1: brain can veto a mechanical stop-loss and hold instead."""
+    _clear_trailing()
+    api = FakeAPI([_pos("bh", shares=20, spent=10, value=4)])  # SL tripped
+    brain = FakeBrain(action="hold", reasoning="thesis intact, holding to settlement")
+    closed = agent.manage_positions(api, stop_loss_pct=-0.5, take_profit_pct=1.0,
+                                    brain=brain)
+    assert closed == 0
+    assert api.sell_calls == []          # did NOT close
+    assert brain.calls[0]["hit"] == "stop_loss"
+
+
+def test_brain_close_uses_brain_reasoning():
+    """L1: brain-approved close carries the brain's reasoning to the sell."""
+    _clear_trailing()
+    api = FakeAPI([_pos("bc", shares=20, spent=10, value=4)])
+    brain = FakeBrain(action="close", reasoning="thesis broke, cutting the loser now")
+    closed = agent.manage_positions(api, stop_loss_pct=-0.5, take_profit_pct=1.0,
+                                    brain=brain)
+    assert closed == 1
+    assert api.sell_calls[0]["reasoning"] == "thesis broke, cutting the loser now"
+
+
+def test_trailing_stop_trips_on_giveback():
+    """L2: a position that ran up then gave back >25% of its peak trips.
+
+    First scan at ratio 1.5 sets the peak; no threshold tripped.
+    Second scan at ratio 1.0 (<= 1.5*0.75=1.125) trips the trailing stop.
+    """
+    _clear_trailing()
+    # take_profit high so it doesn't fire; stop_loss off so only trailing can.
+    p_peak = _pos("tr", shares=10, spent=10, value=15)   # ratio 1.5
+    api1 = FakeAPI([p_peak])
+    brain = FakeBrain(action="close")
+    closed1 = agent.manage_positions(api1, stop_loss_pct=None, take_profit_pct=5.0,
+                                     brain=brain)
+    assert closed1 == 0                                   # just records peak
+
+    p_back = _pos("tr", shares=10, spent=10, value=10)    # ratio 1.0, gave back
+    api2 = FakeAPI([p_back])
+    closed2 = agent.manage_positions(api2, stop_loss_pct=None, take_profit_pct=5.0,
+                                     brain=brain)
+    assert closed2 == 1
+    assert brain.calls[-1]["hit"] == "take_profit"        # trailing -> TP-style review
+
+
+def test_time_to_resolve_passed_to_brain():
+    """L3: hours-to-resolution from the market index reaches the brain."""
+    _clear_trailing()
+    import time as _t
+    p = _pos("tm", shares=20, spent=10, value=4)
+    api = FakeAPI([p])
+    brain = FakeBrain(action="hold")
+    future = _t.time() + 12 * 3600                       # 12h out
+    market_index = {"tm": {"id": "tm", "end_time": future}}
+    agent.manage_positions(api, stop_loss_pct=-0.5, take_profit_pct=1.0,
+                           brain=brain, market_index=market_index)
+    h = brain.calls[0]["hours_to_resolve"]
+    assert h is not None and 11.5 < h < 12.5
+
+
+def test_no_brain_falls_back_to_mechanical_close():
+    """Backward-compat: no brain -> old mechanical close behaviour."""
+    _clear_trailing()
+    api = FakeAPI([_pos("nb", shares=20, spent=10, value=4)])
+    closed = agent.manage_positions(api, stop_loss_pct=-0.5, take_profit_pct=1.0)
+    assert closed == 1
+    assert "stop-loss" in api.sell_calls[0]["reasoning"]

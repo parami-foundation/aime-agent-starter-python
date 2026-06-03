@@ -179,24 +179,64 @@ def check_for_outbox_events(api: APIClient):
 # ---------------------------------------------------------------------------
 
 
+def _hours_to_resolve(position: dict, market_index: dict | None) -> float | None:
+    """Best-effort time-to-resolution in hours for a held position.
+
+    Pulls end_time/resolves_at from the position itself or from a market
+    snapshot keyed by market_id. Returns None if unknown.
+    """
+    raw = (position.get("end_time") or position.get("resolves_at")
+           or position.get("resolution_time"))
+    if raw is None and market_index:
+        m = market_index.get(position.get("market_id")) or {}
+        raw = m.get("end_time") or m.get("resolves_at") or m.get("resolution_time")
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, (int, float)):
+            ts = float(raw)
+            if ts > 1e12:      # ms epoch
+                ts /= 1000.0
+        else:
+            s = str(raw).replace("Z", "+00:00")
+            from datetime import datetime
+            ts = datetime.fromisoformat(s).timestamp()
+        return (ts - time.time()) / 3600.0
+    except Exception:
+        return None
+
+
 def manage_positions(
     api: APIClient,
     *,
     stop_loss_pct: float,
     take_profit_pct: float,
+    brain: "AgentBrain | None" = None,
+    market_index: dict | None = None,
+    trailing_giveback: float | None = 0.25,
 ) -> int:
-    """Scan open positions and close any that hit stop-loss / take-profit.
+    """Scan open positions and decide exits with the agent brain.
 
-    Pure rule-based for now (no LLM in the loop): for each position,
+    Smart-exit chain (replaces the old pure rule-based close):
+      L1  brain.decide_exit() reviews each tripped threshold (close vs hold)
+      L2  trailing stop: lock in gains once a position has run up, then
+          give back at most `trailing_giveback` of the peak (dynamic TP)
+      L3  time-to-resolution is fed into the brain review
+      L4  brain retrieves past exit lessons before deciding (reasoning bank)
+
+    For each position:
         ratio = current_value / total_spent
-    - ratio <= 1 + stop_loss_pct  -> close (stop-loss)
-    - ratio >= 1 + take_profit_pct -> close (take-profit)
+    A threshold is *tripped* when:
+      - ratio <= 1 + stop_loss_pct           (stop-loss), or
+      - ratio >= 1 + take_profit_pct         (take-profit), or
+      - ratio <= peak * (1 - trailing_giveback) while peak >= 1.10 (trailing)
+    A tripped threshold is then handed to brain.decide_exit() which makes
+    the final close/hold call. Without a brain (stub LLM) it closes
+    mechanically, identical to the old behaviour.
 
+    stop_loss_pct is negative (e.g. -0.5). take_profit_pct is positive
+    (e.g. 1.0 = 2x). Set either to None to disable that side.
     Returns number of positions closed.
-
-    stop_loss_pct is negative (e.g. -0.5 = sell when value is half of
-    cost basis). take_profit_pct is positive (e.g. 1.0 = sell at 2x).
-    Set either to None to disable that side.
     """
     try:
         positions = api.get_positions() or []
@@ -207,7 +247,7 @@ def manage_positions(
     if not positions:
         return 0
 
-    log.info("\U0001f4d2 Scanning %d open positions for stop-loss/take-profit...", len(positions))
+    log.info("\U0001f4d2 Scanning %d open positions for exit signals...", len(positions))
     closed = 0
     for p in positions:
         market_id = p.get("market_id")
@@ -223,23 +263,67 @@ def manage_positions(
             continue
 
         ratio = value / spent
-        reason = None
-        if stop_loss_pct is not None and ratio <= 1.0 + stop_loss_pct:
-            reason = (
-                f"stop-loss: value/cost={ratio:.2f} "
-                f"(threshold {1.0 + stop_loss_pct:.2f}); pnl=${pnl:+.2f}"
-            )
-        elif take_profit_pct is not None and ratio >= 1.0 + take_profit_pct:
-            reason = (
-                f"take-profit: value/cost={ratio:.2f} "
-                f"(threshold {1.0 + take_profit_pct:.2f}); pnl=${pnl:+.2f}"
-            )
 
-        if not reason:
+        # L2: track the running peak ratio for this market (trailing stop).
+        peak = mem.update_peak_ratio(market_id, ratio) if market_id else ratio
+
+        # Determine which threshold (if any) tripped.
+        hit = None              # "stop_loss" | "take_profit" | "trailing"
+        threshold = None
+        if stop_loss_pct is not None and ratio <= 1.0 + stop_loss_pct:
+            hit, threshold = "stop_loss", 1.0 + stop_loss_pct
+        elif take_profit_pct is not None and ratio >= 1.0 + take_profit_pct:
+            hit, threshold = "take_profit", 1.0 + take_profit_pct
+        elif (trailing_giveback is not None and peak >= 1.10
+              and ratio <= peak * (1.0 - trailing_giveback)):
+            # Ran up >=10% then gave back `trailing_giveback` of the peak.
+            hit, threshold = "trailing", peak * (1.0 - trailing_giveback)
+
+        if not hit:
             continue
 
+        hours = _hours_to_resolve(p, market_index)
+
+        # L1/L3/L4: let the brain review. No brain -> mechanical close.
+        if brain is not None:
+            review = brain.decide_exit(
+                p, hit=hit if hit != "trailing" else "take_profit",
+                ratio=ratio, threshold=threshold, hours_to_resolve=hours,
+            )
+        else:
+            review = {
+                "action": "close",
+                "confidence": 1.0,
+                "reasoning": (
+                    f"{hit.replace('_','-')}: value/cost={ratio:.2f} "
+                    f"(threshold {threshold:.2f}); pnl=${pnl:+.2f}"
+                ),
+                "internal_note": "mechanical close (no brain)",
+            }
+
+        if review.get("action") == "hold":
+            # Log the hold so the reasoning is captured (this is the
+            # high-value 'why I didn't cut' sample the reasoning bank wants).
+            log.info("  \U0001f9ed hold %s: %s", title, review.get("reasoning"))
+            mem.add_decision(
+                market_id=market_id,
+                market_title=title,
+                position=position or f"idx={outcome_index}",
+                amount=0,
+                confidence=review.get("confidence", 0.5),
+                reasoning=review.get("reasoning", "hold"),
+                internal_note=review.get("internal_note", ""),
+                extra={"action": "hold", "exit_trigger": hit,
+                       "ratio": ratio, "pnl": pnl, "hours_to_resolve": hours},
+            )
+            continue
+
+        reason = review.get("reasoning") or (
+            f"{hit.replace('_','-')}: value/cost={ratio:.2f}; pnl=${pnl:+.2f}")
+        # backend requires >=10 chars of reasoning
+        if len(reason) < 10:
+            reason = f"{reason} (exit {hit}, pnl=${pnl:+.2f})"
         try:
-            # Prefer outcome_index for multi-outcome; fall back to position
             api.sell(
                 market_id=market_id,
                 shares=shares,
@@ -247,17 +331,21 @@ def manage_positions(
                 position=position if outcome_index is None else None,
                 outcome_index=outcome_index,
             )
-            log.info("  \U0001f4b8 closed %s: %s", title, reason)
+            log.info("  \U0001f4b8 closed %s [%s]: %s", title, hit, reason)
             mem.add_decision(
                 market_id=market_id,
                 market_title=title,
                 position=position or f"idx={outcome_index}",
                 amount=-value,                # negative = sell
-                confidence=1.0,
+                confidence=review.get("confidence", 1.0),
                 reasoning=reason,
-                internal_note="rule-based close",
-                extra={"action": "sell", "shares_sold": shares, "pnl": pnl},
+                internal_note=review.get("internal_note", "") or f"{hit} close",
+                extra={"action": "sell", "shares_sold": shares, "pnl": pnl,
+                       "exit_trigger": hit, "ratio": ratio,
+                       "hours_to_resolve": hours},
             )
+            if market_id:
+                mem.clear_peak_ratio(market_id)   # position closed
             closed += 1
         except requests.HTTPError as e:
             body = ""
@@ -287,6 +375,8 @@ def trade_once(
     *,
     stop_loss_pct: float | None = -0.5,
     take_profit_pct: float | None = 1.0,
+    trailing_giveback: float | None = 0.25,
+    smart_exit: bool = True,
     alerts_enabled: bool = True,
     alerts_balance_low: float = 50.0,
     alerts_drawdown: tuple[float, ...] = (0.2, 0.5),
@@ -301,21 +391,26 @@ def trade_once(
             mem.add_tell(m.get("content", ""), source="main_ai",
                          tags=[m.get("kind", "ask")])
 
-    # 2. scan open positions for stop-loss / take-profit BEFORE buying more.
-    # We don't want to keep piling into something that's already underwater.
-    # If both thresholds are None, the user opted out (--no-position-management),
-    # so don't even hit /positions.
+    # 2. fetch markets first (gives us end_time for time-aware exits), then
+    #    scan open positions for exits BEFORE buying more — we don't want to
+    #    keep piling into something that's already underwater.
+    #    If both thresholds are None the user opted out
+    #    (--no-position-management) so we skip the exit scan entirely.
+    log.info("📊 Fetching active markets...")
+    markets = api.fetch_markets()
+    log.info("Found %d active markets", len(markets))
+    market_index = {m.get("id"): m for m in markets if m.get("id")}
+
     if stop_loss_pct is not None or take_profit_pct is not None:
         try:
             manage_positions(api,
                              stop_loss_pct=stop_loss_pct,
-                             take_profit_pct=take_profit_pct)
+                             take_profit_pct=take_profit_pct,
+                             brain=brain if smart_exit else None,
+                             market_index=market_index,
+                             trailing_giveback=trailing_giveback)
         except Exception as e:
             log.warning("position management failed (continuing to buy phase): %s", e)
-
-    log.info("📊 Fetching active markets...")
-    markets = api.fetch_markets()
-    log.info("Found %d active markets", len(markets))
 
     balance = None
     try:
@@ -414,6 +509,7 @@ def trade_once(
 
 def trade_loop(api, brain, fallback_strategy, base_amount, interval,
                *, stop_loss_pct=None, take_profit_pct=None,
+               trailing_giveback=0.25, smart_exit=True,
                alerts_enabled=True, alerts_balance_low=50.0,
                alerts_drawdown=(0.2, 0.5), alerts_profit=(0.1, 0.2, 0.5)):
     while True:
@@ -422,6 +518,8 @@ def trade_loop(api, brain, fallback_strategy, base_amount, interval,
                 api, brain, fallback_strategy, base_amount,
                 stop_loss_pct=stop_loss_pct,
                 take_profit_pct=take_profit_pct,
+                trailing_giveback=trailing_giveback,
+                smart_exit=smart_exit,
                 alerts_enabled=alerts_enabled,
                 alerts_balance_low=alerts_balance_low,
                 alerts_drawdown=alerts_drawdown,
@@ -462,6 +560,16 @@ def main():
                              "Default 1.0 = take profit at 2x. Pass a very large number to disable.")
     parser.add_argument("--no-position-management", action="store_true",
                         help="skip the position-scan / stop-loss / take-profit step at the top of each cycle.")
+    parser.add_argument("--trailing-giveback", type=float, default=0.25,
+                        help="dynamic (trailing) take-profit: once a position runs up >=10%%, close it "
+                             "if it gives back this fraction of its peak value/cost (default 0.25 = 25%%). "
+                             "Set to 0 (or use --no-trailing-stop) to disable.")
+    parser.add_argument("--no-trailing-stop", action="store_true",
+                        help="disable the trailing (dynamic) take-profit; keep only fixed stop-loss/take-profit.")
+    parser.add_argument("--no-smart-exit", action="store_true",
+                        help="disable LLM review of exits — fall back to mechanical stop-loss/take-profit "
+                             "(no 'close vs hold' reasoning, no reasoning-bank reflow on exit). "
+                             "Smart exit is ON by default.")
     parser.add_argument("--no-alerts", action="store_true",
                         help="disable proactive event alerts (balance_low / drawdown / streaks / etc).")
     parser.add_argument("--alerts-balance-low", type=float, default=50.0,
@@ -536,6 +644,8 @@ def main():
 
     sl = None if args.no_position_management else args.stop_loss
     tp = None if args.no_position_management else args.take_profit
+    trailing = None if (args.no_trailing_stop or args.trailing_giveback <= 0) else args.trailing_giveback
+    smart_exit = not args.no_smart_exit
 
     def _parse_csv_floats(s: str) -> tuple[float, ...]:
         out: list[float] = []
@@ -560,6 +670,9 @@ def main():
             log.info("   position rules: stop-loss at value/cost ≤ %.2f, "
                      "take-profit at value/cost ≥ %.2f",
                      1.0 + sl, 1.0 + tp)
+            log.info("   smart exit (LLM close/hold review): %s; trailing take-profit: %s",
+                     "ON" if smart_exit else "OFF (mechanical)",
+                     f"give back {trailing*100:.0f}% of peak" if trailing else "OFF")
         if alerts_enabled:
             wh = "on" if os.environ.get("AIME_WEBHOOK_URL") else "off"
             log.info("   alerts: balance<$%.0f, drawdown @ %s, profit @ %s (webhook: %s)",
@@ -572,6 +685,7 @@ def main():
     if args.once:
         trade_once(api, brain, fallback, args.amount,
                    stop_loss_pct=sl, take_profit_pct=tp,
+                   trailing_giveback=trailing, smart_exit=smart_exit,
                    alerts_enabled=alerts_enabled,
                    alerts_balance_low=args.alerts_balance_low,
                    alerts_drawdown=alerts_drawdown,
@@ -595,6 +709,7 @@ def main():
     try:
         trade_loop(api, brain, fallback, args.amount, args.interval,
                    stop_loss_pct=sl, take_profit_pct=tp,
+                   trailing_giveback=trailing, smart_exit=smart_exit,
                    alerts_enabled=alerts_enabled,
                    alerts_balance_low=args.alerts_balance_low,
                    alerts_drawdown=alerts_drawdown,
